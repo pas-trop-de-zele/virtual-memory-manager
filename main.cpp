@@ -4,6 +4,8 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <cassert>
+#include <vector>
+#include <algorithm>
 
 #pragma warning(disable : 4996)
 
@@ -55,6 +57,8 @@ public:
 };
 
 char *ram = (char *)malloc(NFRAMES * FRAME_SIZE);
+std::vector<int> lru_cache(NFRAMES, -1);
+
 page_node pg_table[PTABLE_SIZE]; // page table and (single) TLB
 page_node tlb[TLB_SIZE];
 
@@ -63,6 +67,15 @@ size_t failed_asserts = 0;
 
 size_t get_page(size_t x) { return 0xff & (x >> 8); }
 size_t get_offset(size_t x) { return 0xff & x; }
+
+void display_lru_cache()
+{
+    for (auto frame : lru_cache)
+    {
+        printf("%d ", frame);
+    }
+    printf("\n");
+}
 
 void get_page_offset(size_t x, size_t &page, size_t &offset)
 {
@@ -169,6 +182,7 @@ void initialize_pg_table_tlb()
         pg_table[i].is_present = false;
         pg_table[i].is_used = false;
     }
+
     for (int i = 0; i < TLB_SIZE; i++)
     {
         tlb[i].npage = (size_t)-1;
@@ -179,8 +193,8 @@ void initialize_pg_table_tlb()
 
 void summarize(size_t pg_faults, size_t tlb_hits)
 {
-    printf("\nPage Fault Percentage: %1.3f%%", (double)pg_faults / 1000);
-    printf("\nTLB Hit Percentage: %1.3f%%\n\n", (double)tlb_hits / 1000);
+    printf("\nPage Fault Percentage: %1.3f%%", (double)pg_faults / 1000 * 100);
+    printf("\nTLB Hit Percentage: %1.3f%%\n\n", (double)tlb_hits / 1000 * 100);
     printf("ALL logical ---> physical assertions PASSED!\n");
     printf("\n\t\t...done.\n");
 }
@@ -217,8 +231,61 @@ void fifo_replace_page(size_t &frame, size_t frames_used)
     frame = frames_used % NFRAMES;
 }
 
-void lru_replace_page(size_t &frame)
+/**
+ * @brief
+ * Swap the most recently used frame to the end
+ * and shift every other frame back by 1 accordingly
+ *
+ * @param frame: frame that is being used
+ * @param frames_used: how many frames used so far
+ */
+void lru_cache_use(size_t frame, size_t frames_used)
 {
+    int frame_index = std::find(lru_cache.begin(), lru_cache.end(), frame) - lru_cache.begin();
+    int most_recently_used_frame_index = frames_used <= NFRAMES ? frames_used - 1 : NFRAMES - 1;
+
+    for (int i = frame_index; i < most_recently_used_frame_index; ++i)
+    {
+        lru_cache[i] = lru_cache[i + 1];
+    }
+    lru_cache[most_recently_used_frame_index] = frame;
+}
+
+void lru_replace_page(size_t &frame, size_t frames_used)
+{
+    size_t lru_frame = lru_cache[0];
+    frame = lru_frame;
+    lru_cache_use(lru_frame, frames_used);
+    printf("CLEAR DATA FROM LRU FRAME %lu\n", frame);
+}
+
+void ptable_remove(int index)
+{
+    pg_table[index].frame_num = -1;
+    pg_table[index].is_present = false;
+    pg_table[index].is_used = false;
+}
+
+void remove_frame_from_tlb_and_ptable(size_t frame)
+{
+    // There may be an entry in tlb that still
+    // contains the old frame
+    for (int i = 0; i < TLB_SIZE; ++i)
+    {
+        if (tlb[i].frame_num == frame)
+        {
+            tlb_remove(i);
+            break;
+        }
+    }
+
+    // There may be an entry in page table that still
+    // contains the old frame
+    int old_ptable_index = find_frame_ptable(frame);
+    if (old_ptable_index != -1)
+    {
+        ptable_remove(old_ptable_index);
+    }
 }
 
 void page_fault(size_t &frame, size_t &page, size_t &frames_used,
@@ -226,19 +293,28 @@ void page_fault(size_t &frame, size_t &page, size_t &frames_used,
 {
     unsigned char buf[BUFSIZ];
     memset(buf, 0, sizeof(buf));
-    bool is_memfull = false;
-    frame = frames_used % NFRAMES;
 
-    if (frames_used >= NFRAMES)
+    frame = frames_used;
+
+    bool is_memfull = frames_used >= NFRAMES ? true : false;
+    if (is_memfull)
     {
+        printf("-----------------------------------MEM_FULL-----------------------------------\n");
         if (REPLACE_POLICY == FIFO)
         {
             fifo_replace_page(frame, frames_used);
         }
         else
         {
+            lru_replace_page(frame, frames_used);
         }
+        remove_frame_from_tlb_and_ptable(frame);
     }
+    else if (REPLACE_POLICY == LRU)
+    {
+        lru_cache[frames_used] = frame;
+    }
+
     // load page into RAM, update pg_table, TLB
     fseek(fbacking, page * FRAME_SIZE, SEEK_SET);
     fread(buf, FRAME_SIZE, 1, fbacking);
@@ -263,23 +339,27 @@ void page_fault(size_t &frame, size_t &page, size_t &frames_used,
 void check_address_value(size_t logic_add, size_t page, size_t offset, size_t physical_add,
                          size_t &prev_frame, size_t frame, int val, int value, size_t o)
 {
-    printf("log: %5lu 0x%04lu (pg:%3lu, off:%3lu)-->phy: %5lu (frm: %3lu) (prv: %3lu)--> val: %4d == value: %4d -- %s",
+    printf("log: %5lu 0x%04lu (pg:%3lu, off:%3lu)-->phy: %5lu (frm: %3lu) (prv: %3lu)--> val: %4d == value: %4d -- %s\n\n",
            logic_add, logic_add, page, offset, physical_add, frame, prev_frame,
            val, value, passed_or_failed(val == value));
 
-    if (frame < prev_frame)
-    {
-        printf("   HIT!\n");
-    }
-    else
-    {
-        prev_frame = frame;
-        printf("----> pg_fault\n");
-    }
+    // WHEN RAM < PAGE TABLE THIS DOES NOT MAKE SENSE
+    // if (frame < prev_frame)
+    // {
+    //     printf("   HIT!\n");
+    // }
+    // else
+    // {
+    //     prev_frame = frame;
+    //     printf("----> pg_fault\n");
+    // }
+
+    // OUTPUT SPACER
     if (o % 5 == 4)
     {
         printf("\n");
     }
+
     // if (o > 20) { exit(-1); }             // to check out first 20 elements
 
     if (val != value)
@@ -322,16 +402,25 @@ void run_simulation()
         if (tlb_index >= 0)
         {
             ++tlb_hits;
+            printf("-------TLB HIT-----------\n");
             tlb_hit(frame, tlb_index);
         }
         else if (pg_table[page].is_present)
         {
+            printf("-------TABLE HIT-----------\n");
             tlb_miss(frame, page, tlb_track);
         }
         else
         {
+            printf("-------PAGE FAULT-----------\n");
             ++pg_faults;
             page_fault(frame, page, frames_used, tlb_track, fbacking);
+        }
+
+        if (REPLACE_POLICY == LRU)
+        {
+            lru_cache_use(frame, frames_used);
+            display_lru_cache();
         }
 
         physical_add = (frame * FRAME_SIZE) + offset;
